@@ -1,0 +1,15 @@
+[Unit]
+Description=KVM HID USB gadget (在 adbd 的 g1 上追加键鼠接口)
+After=adbd.service
+# adbd 若未运行则 g1 不存在，本服务会失败；属预期，先修 adbd
+BindsTo=adbd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash /opt/KVM_Gesture/setup_hid_gadget.sh start
+ExecStop=/bin/bash /opt/KVM_Gesture/setup_hid_gadget.sh stop
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=KVM gesture event to HID injector (注入侧)
+After=kvm-hid-gadget.service
+# 识别服务先落盘，本服务 tail 事件文件；两边解耦可独立重启
+After=kvm-gesture.service
+
+[Service]
+Type=simple
+User=bianbu
+Group=bianbu
+WorkingDirectory=/opt/KVM_Gesture
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/KVM_Gesture/hid_inject.py \
+    --events /var/log/kvm_gesture/events.jsonl
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

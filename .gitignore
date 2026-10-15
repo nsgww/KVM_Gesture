@@ -1,0 +1,4 @@
+__pycache__/
+*.pycn.shaders/
+out_e2e.png
+*.tar.gz
