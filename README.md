@@ -76,11 +76,11 @@ python3 kvm_gesture.py --source test.mp4 --out /tmp/ev.jsonl --stats
 | action | 触发条件 | 底层应做 |
 |---|---|---|
 | `MOVE` | 每帧，食指（或掌心中点）作为指针 | 指针移动到 (x, y) |
-| `GRAB` | 拇指+食指捏合开始 | 鼠标左键按下 |
-| `RELEASE` | 捏合结束，或**手离开画面** | 左键抬起 |
-| `CLICK` | 短促捏合 < 0.35s；或食指+中指伸出并拢 | 单击 |
-| `SWIPE_UP/DOWN/LEFT/RIGHT` | 0.42s 窗口内位移 > 0.18 | 上/下/左/右翻页、滚动 |
-| `ZOOM_IN/OUT` | 捏合距离变化率超阈值 | 缩放 |
+| `GRAB` | 拇指+食指捏合（连续 2 帧确认，且手基本静止） | 鼠标左键按下 |
+| `RELEASE` | 捏合结束，或**手离开画面**（0.6s 宽限后） | 左键抬起 |
+| `CLICK` | 短促捏合 < 0.5s | 单击 |
+| `SWIPE_UP/DOWN/LEFT/RIGHT` | 静止起步后 0.42s 窗口内位移 > 0.18；挥手后 1.2s 内屏蔽反向（防回位误判） | 上/下/左/右翻页、滚动 |
+| `ZOOM_IN/OUT` | 捏住且手静止时，捏合距离缓慢同向累计 > 0.25（快速张合视为松开，不计入） | 缩放 |
 
 > 手丢失时一定补发 `RELEASE`，否则底层会卡在按下状态——这是容易踩的坑。
 
@@ -94,7 +94,7 @@ python3 kvm_gesture.py --source test.mp4 --out /tmp/ev.jsonl --stats
 | `--preview` | off | 骨架叠加预览（需图形环境） |
 | `--control-margin` | 0.10 | 控制区内缩比例，手贴边时防出画丢事件 |
 | `--no-mirror` | off | 前置摄像头成镜像，默认开启符合直觉 |
-| `--smooth` | 0.35 | 平滑系数，越小越稳越滞后 |
+| `--smooth` | 0.45 | 平滑系数，越小越稳越滞后 |
 | `--max-hands` | 1 | 最大跟踪手数 |
 | `--palm-threshold` | 0.4 | 手掌检测阈值 |
 | `--hand-conf` | 0.5 | 关键点置信度阈值 |

@@ -22,7 +22,7 @@ action 取值：
     MOVE        指针移动（食指为指针，位置=控制区归一化坐标）
     GRAB        捏合开始（拇指+食指）→ 底层按下
     RELEASE     捏合结束 / 手丢失     → 底层抬起
-    CLICK       短促捏合(<0.35s)，或 CSDN 方案的食指+中指并拢
+    CLICK       短促捏合(<0.35s)
     SWIPE_UP/DOWN/LEFT/RIGHT   窗口内快速位移
     ZOOM_IN/ZOOM_OUT          捏合距离变化（双手缩放在此扩展）
 """
@@ -84,17 +84,21 @@ ACTION_ZOOM_OUT = "ZOOM_OUT"
 class GestureConfig:
     control_margin: float = 0.10     # 控制区内缩比例（边缘留白，防出画丢事件）
     mirror_x: bool = True            # 前置摄像头成镜像，符合人直觉
-    smooth_alpha: float = 0.35       # 指数平滑：越小越稳越滞后
-    pinch_on: float = 0.55           # 捏合进入阈值（拇指尖-食指尖 / 掌宽）
-    pinch_off: float = 0.70# 捏合退出阈值（迟滞，防抖动误触）
-    tap_max_time: float = 0.35       # 短于此视为点击
-    swipe_min_disp: float = 0.18# 归一化位移阈值
+    smooth_alpha: float = 0.45       # 指数平滑：越小越稳越滞后
+    pinch_on: float = 0.65           # 捏合进入阈值（拇指尖-食指尖 / 掌宽）
+    pinch_off: float = 0.80          # 捏合退出阈值（迟滞，防抖动误触）
+    grab_debounce: int = 2           # 捏合/张开需连续帧数确认，防单帧抖动误触
+    grab_still: float = 0.12         # 触发抓取前 0.25s 内手需基本不动（挥手不误抓）
+    tap_max_time: float = 0.5        # 短于此视为点击
+    swipe_min_disp: float = 0.18     # 归一化位移阈值
     swipe_window: float = 0.42       # 秒
     swipe_cooldown: float = 0.60     # 秒
-    two_finger_on: float = 0.60      # CSDN 方案：食指+中指并拢阈值
-    two_finger_off: float = 0.80
-    zoom_min_delta: float = 0.02
-    zoom_cooldown: float = 0.25
+    swipe_reverse_block: float = 1.2 # 挥手后屏蔽反方向挥手的时长（防回位误判）
+    zoom_min_delta: float = 0.05     # 每帧有效变化下限（中值滤波后）
+    zoom_max_delta: float = 0.15     # 单帧超过此值=快速张合（松开动作），不计入缩放
+    zoom_accum: float = 0.25         # 同向累计变化达到此值才触发一次缩放
+    zoom_cooldown: float = 0.6
+    lost_grace: float = 0.6          # 手消失宽限期（秒），短暂丢失不松开
 
 
 class GestureEngine:
@@ -105,12 +109,17 @@ class GestureEngine:
         self.smooth: Optional[np.ndarray] = None
         self.grabbing = False
         self.pinch_latched = False
-        self.two_finger_down = False
+        self.pinch_run = 0
+        self.open_run = 0
+        self.pinch_hist: List[float] = []
+        self.absent_since: Optional[float] = None
         self.grab_start_ts = 0.0
         self.track: List[dict] = []
         self.last_swipe_ts = 0.0
+        self.last_swipe_dir = ""     # 上次挥手方向，用于反向屏蔽
         self.last_zoom_ts = 0.0
         self.prev_pinch_dist: Optional[float] = None
+        self._zoom_acc = 0.0
 
     # -- 几何 -------------------------------------------------------------
     @staticmethod
@@ -138,12 +147,22 @@ class GestureEngine:
         ts = ts if ts is not None else time.time()
 
         if hand_result is None:
-            return self._on_hand_lost(ts)
+            # 宽限期：短暂丢失（检测抖动）静默等待，超时才按手离开处理
+            if self.absent_since is None:
+                self.absent_since = ts
+            if ts - self.absent_since >= self.cfg.lost_grace:
+                return self._on_hand_lost(ts)
+            return []
+        self.absent_since = None
 
         pts = hand_result[4:4 + 63].reshape(21, 3)
         fingers = self._finger_state(pts)
-        pinch_dist = self._dist(pts[THUMB_TIP], pts[INDEX_TIP]) / fingers["scale"]
-        two_dist = self._dist(pts[INDEX_TIP], pts[MIDDLE_TIP]) / fingers["scale"]
+        # 中值滤波：单帧关键点跳变（拇指尖误检）会被滤掉，防 ZOOM/GRAB 误触
+        raw_pinch = self._dist(pts[THUMB_TIP], pts[INDEX_TIP]) / fingers["scale"]
+        self.pinch_hist.append(raw_pinch)
+        if len(self.pinch_hist) > 3:
+            self.pinch_hist.pop(0)
+        pinch_dist = sorted(self.pinch_hist)[len(self.pinch_hist) // 2]
 
         events: List[dict] = []
 
@@ -151,55 +170,100 @@ class GestureEngine:
         pointer = self._pointer_target(pts, fingers, w, h)
         if pointer is not None:
             self.track.append({"t": ts, "x": float(pointer[0]), "y": float(pointer[1])})
-            while len(self.track) > 2 and ts - self.track[0]["t"] > self.cfg.swipe_window:
+            keep = self.cfg.swipe_window + 0.3     # 多留一段，供"挥前静止"判断
+            while len(self.track) > 2 and ts - self.track[0]["t"] > keep:
                 self.track.pop(0)
             self.smooth = (pointer if self.smooth is None else
                            self.cfg.smooth_alpha * pointer
                            + (1 - self.cfg.smooth_alpha) * self.smooth)
             events.append(self._event(ACTION_MOVE, self.smooth, ts))
 
-        # 2) GRAB / RELEASE / CLICK（迟滞 + 短按判定）
+        # 2) GRAB / RELEASE / CLICK（迟滞 + 连续帧确认 + 短按判定）
         if pinch_dist < self.cfg.pinch_on:
             self.pinch_latched = False
         elif pinch_dist > self.cfg.pinch_off:
             self.pinch_latched = True
 
-        if not self.pinch_latched and not self.grabbing:
+        if not self.pinch_latched:
+            self.pinch_run += 1
+            self.open_run = 0
+        else:
+            self.open_run += 1
+            self.pinch_run = 0
+
+        if not self.grabbing and self.pinch_run >= self.cfg.grab_debounce \
+                and self._still_enough(ts):
             self.grabbing = True
             self.grab_start_ts = ts
             events.append(self._event(ACTION_GRAB, self.smooth, ts,
                                       extra={"pinch": pinch_dist}))
-        elif self.pinch_latched and self.grabbing:
+        elif self.grabbing and self.open_run >= self.cfg.grab_debounce:
             self.grabbing = False
             if ts - self.grab_start_ts < self.cfg.tap_max_time:
                 events.append(self._event(ACTION_CLICK, self.smooth, ts))
             events.append(self._event(ACTION_RELEASE, self.smooth, ts))
 
-        # 3) CSDN 方案：食指+中指同时伸出且并拢 → 点击
-        two_ext = fingers["index"] and fingers["middle"]
-        if two_ext and two_dist < self.cfg.two_finger_on:
-            self.two_finger_down = True
-        if (not two_ext or two_dist > self.cfg.two_finger_off) and self.two_finger_down:
-            self.two_finger_down = False
-            events.append(self._event(ACTION_CLICK, self.smooth, ts,
-                                      extra={"gesture": "two_finger"}))
-
-        # 4) SWIPE
-        if len(self.track) >= 2 and ts - self.last_swipe_ts > self.cfg.swipe_cooldown:
-            dx = self.track[-1]["x"] - self.track[0]["x"]
-            dy = self.track[-1]["y"] - self.track[0]["y"]
-            if abs(dx) > self.cfg.swipe_min_disp or abs(dy) > self.cfg.swipe_min_disp:
+        # 4) SWIPE（抓取中不触发；要求挥动前静止，防回位动作误判）
+        if (not self.grabbing and len(self.track) >= 2
+                and ts - self.last_swipe_ts > self.cfg.swipe_cooldown):
+            recent = [p for p in self.track if ts - p["t"] <= self.cfg.swipe_window]
+            dx = recent[-1]["x"] - recent[0]["x"] if len(recent) >= 2 else 0.0
+            dy = recent[-1]["y"] - recent[0]["y"] if len(recent) >= 2 else 0.0
+            if (len(recent) >= 2 and self._at_rest_before(ts)
+                    and (abs(dx) > self.cfg.swipe_min_disp
+                         or abs(dy) > self.cfg.swipe_min_disp)):
                 act = (ACTION_SWIPE_RIGHT if dx > 0 else ACTION_SWIPE_LEFT) if abs(dx) > abs(dy) \
                     else (ACTION_SWIPE_DOWN if dy > 0 else ACTION_SWIPE_UP)
+                # 反向屏蔽：挥手后短时间内反方向动作视为回位，不上报
+                opposite = {ACTION_SWIPE_UP: ACTION_SWIPE_DOWN, ACTION_SWIPE_DOWN: ACTION_SWIPE_UP,
+                            ACTION_SWIPE_LEFT: ACTION_SWIPE_RIGHT, ACTION_SWIPE_RIGHT: ACTION_SWIPE_LEFT}
+                if (act == opposite.get(self.last_swipe_dir)
+                        and ts - self.last_swipe_ts < self.cfg.swipe_reverse_block):
+                    self.track = self.track[-1:]
+                    return events
                 events.append(self._event(act, self.smooth, ts, extra={"dx": dx, "dy": dy}))
                 self.last_swipe_ts = ts
+                self.last_swipe_dir = act
                 self.track = self.track[-1:]
 
-        # 5) ZOOM（基于捏合距离变化；双手缩放在此基础上扩展）
-        events.extend(self._zoom_events(ts, pinch_dist))
+        # 5) ZOOM（仅抓取中且手基本静止：捏住后张合手指才算缩放）
+        if self.grabbing and self._stationary(ts):
+            events.extend(self._zoom_events(ts, pinch_dist))
+        else:
+            self.prev_pinch_dist = pinch_dist
         return events
 
     # -- 内部 -------------------------------------------------------------
+    def _at_rest_before(self, ts) -> bool:
+        """挥动窗口之前 0.25s 内手是否基本静止（位移 < 0.06）。"""
+        t1 = ts - self.cfg.swipe_window
+        pre = [p for p in self.track if t1 - 0.25 <= p["t"] <= t1]
+        if len(pre) < 2:
+            return True                       # 历史不足（刚抬手）不拦
+        dx, dy = self._track_disp(pre)
+        return dx < 0.06 and dy < 0.06
+
+    def _still_enough(self, ts) -> bool:
+        """最近 0.25s 位移 < grab_still 才允许触发新抓取（挥手中不误抓）。"""
+        recent = [p for p in self.track if ts - p["t"] <= 0.25]
+        if len(recent) < 2:
+            return True                       # 刚抬手历史不足，不拦
+        dx, dy = self._track_disp(recent)
+        return dx < self.cfg.grab_still and dy < self.cfg.grab_still
+
+    def _stationary(self, ts) -> bool:
+        """最近 0.3s 手是否基本不动（位移 < 0.05）。"""
+        recent = [p for p in self.track if ts - p["t"] <= 0.3]
+        if len(recent) < 2:
+            return False
+        dx, dy = self._track_disp(recent)
+        return dx < 0.05 and dy < 0.05
+
+    @staticmethod
+    def _track_disp(pts) -> Tuple[float, float]:
+        xs = [p["x"] for p in pts]
+        ys = [p["y"] for p in pts]
+        return max(xs) - min(xs), max(ys) - min(ys)
     def _pointer_target(self, pts, fingers, w, h):
         m = self.cfg.control_margin
         tip = pts[INDEX_TIP] if fingers["index"] else (pts[MIDDLE_MCP] + pts[WRIST]) / 2
@@ -216,13 +280,22 @@ class GestureEngine:
             return events
         delta = pinch_dist - self.prev_pinch_dist
         self.prev_pinch_dist = pinch_dist
-        if ts - self.last_zoom_ts < self.cfg.zoom_cooldown:
+        if abs(delta) > self.cfg.zoom_max_delta:
+            self._zoom_acc = 0.0          # 快速张合（松开/捏死），清零不计
             return events
         if abs(delta) < self.cfg.zoom_min_delta:
+            return events                 # 静止帧：保留累计，不清零
+        if delta * self._zoom_acc < 0:
+            self._zoom_acc = 0.0          # 换向清零
+        self._zoom_acc += delta
+        if ts - self.last_zoom_ts < self.cfg.zoom_cooldown:
             return events
+        if abs(self._zoom_acc) < self.cfg.zoom_accum:
+            return events
+        act = ACTION_ZOOM_IN if self._zoom_acc > 0 else ACTION_ZOOM_OUT
+        events.append(self._event(act, self.smooth, ts, extra={"delta": self._zoom_acc}))
+        self._zoom_acc = 0.0
         self.last_zoom_ts = ts
-        act = ACTION_ZOOM_IN if delta > 0 else ACTION_ZOOM_OUT
-        events.append(self._event(act, self.smooth, ts, extra={"delta": delta}))
         return events
 
     def _on_hand_lost(self, ts) -> List[dict]:
@@ -237,6 +310,12 @@ class GestureEngine:
         self.smooth = None
         self.track = []
         self.prev_pinch_dist = None
+        self.pinch_hist = []
+        self.pinch_run = 0
+        self.open_run = 0
+        self.pinch_latched = False
+        self.absent_since = None
+        self._zoom_acc = 0.0
         return events
 
     def _event(self, action, xy, ts, extra=None) -> dict:

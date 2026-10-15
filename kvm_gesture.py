@@ -75,12 +75,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--palm-every", type=int, default=2,
                    help="每N帧做一次 palm 检测，中间帧复用（板端默认2，实测提速1.5倍）")
     p.add_argument("--max-seconds", type=float, default=0, help="运行多少秒后自动退出，0=不限")
+    p.add_argument("--reopen-after", type=float, default=5.0,
+                   help="视频流多少秒无新帧后自动重开，0=禁用")
     p.add_argument("--stats", action="store_true", help="退出时打印性能统计")
     return p
 
 
 def open_source(src: str, args):
-    if os.path.exists(src):
+    if src.startswith(("rtsp://", "http://", "https://")):
+        # 网络摄像头（RTSP/HTTP 流）。FFMPEG 后端 + 最小缓冲降低延迟。
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                              "rtsp_transport;tcp|timeout;5000000|rw_timeout;5000000"
+                              "|max_delay;200000|buffer_size;2048000")
+        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        kind = f"stream:{src.split('@')[-1]}"   # 日志里不打印账号密码
+    elif os.path.exists(src):
         cap = cv2.VideoCapture(src)
         kind = f"file:{src}"
     else:
@@ -132,14 +142,37 @@ def main() -> int:
     action_count = {}
 
     print("[run] press Ctrl-C to stop", flush=True)
+    last_frame = time.time()
     try:
         while _running:
             ok, frame = cap.read()
             if not ok or frame is None:
                 if kind.startswith("file"):
                     break
-                time.sleep(0.01)
+                # 流卡死看门狗：超过 --reopen-after 秒无新帧则重开视频源。
+                # RTSP/HEVC 丢参考帧后 FFmpeg 可能恢复不了，重开是唯一可靠手段。
+                if args.reopen_after > 0 and time.time() - last_frame > args.reopen_after:
+                    print("[warn] 视频流超时，重开视频源 ...", flush=True)
+                    for e in rec.engine.update(None, 1, 1):   # 补 RELEASE，防按键卡死
+                        line = json.dumps(e, ensure_ascii=False, separators=(",", ":"))
+                        if out_f:
+                            out_f.write(line + "\n")
+                        if not args.quiet:
+                            print(line, flush=True)
+                    cap.release()
+                    while _running:
+                        try:
+                            cap, kind = open_source(args.source, args)
+                            print("[warn] 视频源已重开", flush=True)
+                            break
+                        except Exception as exc:
+                            print(f"[warn] 重开失败: {exc}，2s 后重试", flush=True)
+                            time.sleep(2)
+                    last_frame = time.time()
+                time.sleep(0.05)
                 continue
+
+            last_frame = time.time()
 
             events, vis, found = rec.process(frame)
             frames += 1
