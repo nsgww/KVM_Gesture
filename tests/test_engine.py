@@ -214,6 +214,29 @@ def test_hid_click_does_not_release_grab():
     assert inj.buttons == 0
 
 
+def test_mode_filter_touch_only_and_mouse_only():
+    class Fake:
+        def __init__(self):
+            self.reports = []
+
+        def write(self, r):
+            self.reports.append(r)
+            return True
+
+    hid = Fake()
+    inj = Injector(hid, mode="touch")
+    inj.handle({"action": "CLICK", "x": 0.5, "y": 0.5, "ts": int(time.time() * 1000)})
+    assert hid.reports
+    assert all(r[0] != 1 for r in hid.reports), "touch 模式不应发鼠标报告"
+    assert any(r[0] == 2 for r in hid.reports), "touch 模式应发触摸报告"
+
+    hid2 = Fake()
+    inj2 = Injector(hid2, mode="mouse")
+    inj2.handle({"action": "CLICK", "x": 0.5, "y": 0.5, "ts": int(time.time() * 1000)})
+    assert all(r[0] != 2 for r in hid2.reports), "mouse 模式不应发触摸报告"
+    assert any(r[0] == 1 for r in hid2.reports), "mouse 模式应发鼠标报告"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:

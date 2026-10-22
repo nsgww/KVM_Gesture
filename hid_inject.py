@@ -137,13 +137,48 @@ class HidWriter:
             return False
 
 
+class _ModeFilter:
+    """按 Report ID 过滤输出：touch 模式丢鼠标报告，mouse 模式丢触摸报告，键盘始终放行。
+
+    透明代理 HidWriter：just_connected/connected 等属性读写透传到内层对象。
+    """
+
+    def __init__(self, inner, send_mouse: bool, send_touch: bool):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_send_mouse", send_mouse)
+        object.__setattr__(self, "_send_touch", send_touch)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __setattr__(self, name, value):
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._inner, name, value)
+
+    def write(self, report: bytes) -> bool:
+        rid = report[0] if report else 0
+        if rid == RID_MOUSE and not self._send_mouse:
+            return True
+        if rid == RID_TOUCH and not self._send_touch:
+            return True
+        return self._inner.write(report)
+
+
 class Injector:
     """事件流 → HID 报告（鼠标+触摸双模同发）。
 
     坐标内部用归一化 0~1 保存，发报告时按各设备的 Logical Maximum 缩放。
     """
 
-    def __init__(self, hid: HidWriter, move_rate: float = 60.0):
+    def __init__(self, hid: HidWriter, move_rate: float = 60.0, mode: str = "dual"):
+        # mode: dual=鼠标+触摸双发（默认）；touch=只发触摸（会议大屏）；
+        #       mouse=只发鼠标（无触摸主机，如 macOS）
+        if mode != "dual":
+            hid = _ModeFilter(hid,
+                              send_mouse=mode == "mouse",
+                              send_touch=mode == "touch")
         self.hid = hid
         self.nx = 0.5
         self.ny = 0.5
@@ -358,10 +393,12 @@ def main() -> int:
     ap.add_argument("--hidg", default=HIDG, help="hidg 设备路径")
     ap.add_argument("--dry-run", action="store_true", help="不写设备，打印报告字节")
     ap.add_argument("--move-rate", type=float, default=60.0, help="MOVE 事件最大转发频率")
+    ap.add_argument("--mode", choices=("dual", "touch", "mouse"), default="dual",
+                    help="注入模式：dual=鼠标+触摸双发（默认），touch=只发触摸（会议大屏），mouse=只发鼠标")
     args = ap.parse_args()
 
     hid = HidWriter(args.hidg, dry_run=args.dry_run)
-    inj = Injector(hid, move_rate=args.move_rate)
+    inj = Injector(hid, move_rate=args.move_rate, mode=args.mode)
 
     lines = sys.stdin if args.stdin else follow_file(args.events)
     n = 0
