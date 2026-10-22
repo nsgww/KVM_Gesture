@@ -1,9 +1,14 @@
-# KVM_Gesture —— 隔空手势识别（识别侧）
+# KVM_Gesture —— 隔空手势识别
 
 ## 这是什么
 
-识别侧程序：摄像头 → 手部 21 关键点 → 手势状态机 → **输出「动作 + 坐标」事件流**。
-按键鼠/触摸注入由底层板子（USB OTG HID gadget）完成，本程序不负责注入。
+板端一体化程序：**摄像头 → 手部 21 关键点 → 手势状态机 → 事件流 → USB HID 注入**，
+通过板子的 USB OTG 口模拟键鼠直接控制会议屏，不依赖外部设备。
+
+- 识别侧（`kvm_gesture.py` + `gesture_core.py`）：输出「动作 + 坐标」事件流（JSONL）
+- 注入侧（`hid_inject.py` + `setup_hid_gadget.sh`）：事件流翻译成 HID 报告写 `/dev/hidg0`
+
+两侧可独立部署：只跑识别侧时事件流可落文件/管道，供其他注入方消费。
 
 ## 为什么不用 MediaPipe
 
@@ -21,19 +26,41 @@ MediaPipe 官方没有 riscv64 wheel，无法 `pip install mediapipe`。
 
 依赖仅 **numpy + opencv-python**（板子已预装），`onnxruntime` 为可选加速后端。
 
+## 模型下载
+
+ONNX 模型不入库（`.gitignore` 排除），从 OpenCV opencv_zoo 官方仓库下载到 `models/`：
+
+```bash
+cd models
+wget https://github.com/opencv/opencv_zoo/raw/main/models/palm_detection_mediapipe/palm_detection_mediapipe_2023feb.onnx
+wget https://github.com/opencv/opencv_zoo/raw/main/models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx
+# 可选：int8 量化版（更快；下载后用 --handpose-model 指定加载）
+wget https://github.com/opencv/opencv_zoo/raw/main/models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb_int8.onnx
+```
+
+模型主页（含 demo 与说明）：
+- https://github.com/opencv/opencv_zoo/tree/main/models/palm_detection_mediapipe
+- https://github.com/opencv/opencv_zoo/tree/main/models/handpose_estimation_mediapipe
+
+`models/mp_palmdet.py`、`models/mp_handpose.py` 为官方参考实现，已随仓库提供，无需下载。
+
 ## 目录结构
 
 ```
 /opt/KVM_Gesture/
 ├── kvm_gesture.py          主程序（入口）
 ├── gesture_core.py         关键点推理封装 + 手势状态机
-├── selftest.py             推理链路自检（无需摄像头）
-├── e2e_test.py             端到端验证（图片/视频 → 事件流）
+├── hid_inject.py           HID 注入（事件流 → /dev/hidg0）
 ├── deploy.sh               部署检查脚本
-├── remote.py               从 PC 侧远程运维板子（paramiko）
+├── install_service.sh      安装 systemd 服务
+├── setup_hid_gadget.sh     配置 USB HID gadget（ADB+键鼠复合设备）
+├── tests/
+│   ├── selftest.py         推理链路自检（无需摄像头）
+│   ├── e2e_test.py         端到端验证（图片 → 事件流，产物 out_e2e.png 不入库）
+│   └── data/               测试素材（testdata_pointing_up.jpg、synth_hand.mp4）
 └── models/
-    ├── palm_detection_mediapipe_2023feb.onnx
-    ├── handpose_estimation_mediapipe_2023feb.onnx
+    ├── palm_detection_mediapipe_2023feb.onnx        # 需下载，见上节
+    ├── handpose_estimation_mediapipe_2023feb.onnx   # 需下载，见上节
     ├── mp_palmdet.py       官方参考实现（推理用）
     └── mp_handpose.py      官方参考实现（推理用）
 ```
@@ -44,7 +71,7 @@ MediaPipe 官方没有 riscv64 wheel，无法 `pip install mediapipe`。
 cd /opt/KVM_Gesture
 
 # 1. 自检（不需要摄像头）
-python3 selftest.py
+python3 tests/selftest.py
 
 # 2. 实时运行，事件输出到文件
 python3 kvm_gesture.py --source 0 --out /tmp/events.jsonl --stats
@@ -75,12 +102,12 @@ python3 kvm_gesture.py --source test.mp4 --out /tmp/ev.jsonl --stats
 
 | action | 触发条件 | 底层应做 |
 |---|---|---|
-| `MOVE` | 每帧，食指（或掌心中点）作为指针 | 指针移动到 (x, y) |
-| `GRAB` | 拇指+食指捏合（连续 2 帧确认，且手基本静止） | 鼠标左键按下 |
-| `RELEASE` | 捏合结束，或**手离开画面**（0.6s 宽限后） | 左键抬起 |
-| `CLICK` | 短促捏合 < 0.5s | 单击 |
-| `SWIPE_UP/DOWN/LEFT/RIGHT` | 静止起步后 0.42s 窗口内位移 > 0.18；挥手后 1.2s 内屏蔽反向（防回位误判） | 上/下/左/右翻页、滚动 |
-| `ZOOM_IN/OUT` | 捏住且手静止时，捏合距离缓慢同向累计 > 0.25（快速张合视为松开，不计入） | 缩放 |
+| `MOVE` | 每帧，食指（或掌心中点）作为指针；握拳时冻结 | 指针移动到 (x, y) |
+| `GRAB` | 拇指+食指捏合开始（食指需伸出） | 鼠标左键按下 |
+| `RELEASE` | 捏合结束，或**手离开画面** | 左键抬起 |
+| `CLICK` | 食指尖碰中指尖（碰一次触发一次） | 单击 |
+| `SWIPE_UP/DOWN/LEFT/RIGHT` | 0.42s 窗口内位移 > 0.18（抓取中/握拳不触发） | 上/下/左/右翻页、滚动 |
+| `ZOOM_IN/OUT` | 握拳后手整体上移 / 下移（0.5s 窗口内位移 > 0.15） | 缩放 |
 
 > 手丢失时一定补发 `RELEASE`，否则底层会卡在按下状态——这是容易踩的坑。
 
@@ -94,7 +121,7 @@ python3 kvm_gesture.py --source test.mp4 --out /tmp/ev.jsonl --stats
 | `--preview` | off | 骨架叠加预览（需图形环境） |
 | `--control-margin` | 0.10 | 控制区内缩比例，手贴边时防出画丢事件 |
 | `--no-mirror` | off | 前置摄像头成镜像，默认开启符合直觉 |
-| `--smooth` | 0.45 | 平滑系数，越小越稳越滞后 |
+| `--smooth` | 0.35 | 平滑系数，越小越稳越滞后 |
 | `--max-hands` | 1 | 最大跟踪手数 |
 | `--palm-threshold` | 0.4 | 手掌检测阈值 |
 | `--hand-conf` | 0.5 | 关键点置信度阈值 |
@@ -176,12 +203,11 @@ echo '{"action":"MOVE","x":0.5,"y":0.5}' | python3 hid_inject.py --stdin --dry-r
 
 ## 已知限制
 
-- 当前摄像头未接入板子，实时链路待硬件到位后联调。
-- `ZOOM` 目前基于**单手捏合距离变化**作为代理指标；真正的双手缩放需要扩展
-  `_zoom_events` 为两捏合点中点距离的比值（接口已预留）。
-- HID 用「绝对坐标鼠标」而非 Multi-Touch digitizer：`GRAB/RELEASE` 映射为鼠标左键
-  而非触点，`ZOOM` 用 Ctrl+滚轮模拟。若目标屏只认触摸不认鼠标，再换 digitizer
-  描述符（改动集中在 `setup_hid_gadget.sh` 的描述符和 `hid_inject.py` 的报告格式）。
+- `ZOOM` 为单手实现：握拳后手整体上移=放大、下移=缩小（握拳期间指针冻结，
+  主机 Ctrl+滚轮作用在指针停着的位置）。双手张合缩放未实现（需 `max_hands=2`，
+  帧率会明显下降）。
+- HID 为鼠标+触摸双模同发：同一事件同时产出绝对坐标鼠标报告和 digitizer
+  触点报告，主机认哪个用哪个（Windows 认鼠标；只认 digitizer 的会议大屏用触摸）。
 
 ## 联调建议
 

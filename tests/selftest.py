@@ -7,10 +7,10 @@ import sys
 import cv2
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gesture_core import GestureRecognizer, GestureConfig, ACTION_MOVE, ACTION_GRAB
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PALM = os.path.join(ROOT, "models", "palm_detection_mediapipe_2023feb.onnx")
 HAND = os.path.join(ROOT, "models", "handpose_estimation_mediapipe_2023feb.onnx")
 
@@ -30,6 +30,8 @@ print("== look for a real hand test image ==")
 cands = []
 for pat in ("example_outputs/*.png", "example_outputs/*.jpg", "*.jpg", "*.png"):
     cands += glob.glob(os.path.join(ROOT, "models", pat))
+for pat in ("*.jpg", "*.png"):
+    cands += glob.glob(os.path.join(ROOT, "tests", "data", pat))
 cands = [c for c in cands if "onnx" not in c.lower()]
 print("  candidates:", [os.path.basename(c) for c in cands][:10])
 

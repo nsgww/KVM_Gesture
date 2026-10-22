@@ -10,12 +10,12 @@ import sys
 import cv2
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gesture_core import GestureRecognizer, GestureConfig, draw_hud
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-IMG = os.path.join(ROOT, "testdata_pointing_up.jpg")
-OUT = os.path.join(ROOT, "out_e2e.png")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+IMG = os.path.join(ROOT, "tests", "data", "testdata_pointing_up.jpg")
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out_e2e.png")
 
 rec = GestureRecognizer(cfg=GestureConfig(), palm_threshold=0.4, hand_conf=0.5)
 

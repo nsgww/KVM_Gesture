@@ -17,7 +17,7 @@
   MOVE                鼠标指针移动；抓取中=鼠标拖拽+触摸拖动
   GRAB                鼠标左键按下 + 触摸触点 0 按下
   RELEASE             鼠标左键抬起 + 触摸抬起
-  CLICK               鼠标点击 + 触摸点按
+  CLICK               鼠标点击 + 触摸点按（抓取按下期间忽略，避免把左键抬掉）
   SWIPE_UP/DOWN       鼠标滚轮 ±1 + 触摸真实滑动
   SWIPE_LEFT/RIGHT    键盘 →/← + 触摸水平滑动（左滑=下一页）
   ZOOM_IN/OUT         Ctrl+滚轮 ±1 + 触摸双指捏合
@@ -57,7 +57,8 @@ MOD_LCTRL = 0x01
 KEY_RIGHT = 0x4F
 KEY_LEFT = 0x50
 
-CLICK_HOLD_S = 0.04
+CLICK_HOLD_S = 0.18
+GRAB_WATCHDOG_S = 1.5  # 抓取状态断流这么久强制 RELEASE，防"左键按住不放"
 SWIPE_STEPS = 10
 SWIPE_INTERVAL_S = 0.012
 SWIPE_DIST = 0.25            # 归一化位移（占屏比例）
@@ -75,6 +76,8 @@ class HidWriter:
         self.dry_run = dry_run
         self.fd = None
         self._err_ts = 0.0
+        self.connected = False       # 写入真正成功过才算连上主机
+        self.just_connected = False  # 断→连跳变沿，Injector 据此做防误触
         if not dry_run:
             self._open()
 
@@ -102,6 +105,9 @@ class HidWriter:
                 return False
         try:
             os.write(self.fd, report)
+            if not self.connected:
+                self.connected = True
+                self.just_connected = True
             return True
         except BlockingIOError:
             # 主机中断端点短暂拥塞（几 ms 就会轮询一次）：短重试，
@@ -110,6 +116,9 @@ class HidWriter:
                 time.sleep(0.005)
                 try:
                     os.write(self.fd, report)
+                    if not self.connected:
+                        self.connected = True
+                        self.just_connected = True
                     return True
                 except BlockingIOError:
                     continue
@@ -118,6 +127,7 @@ class HidWriter:
             return False
         except OSError as e:           # 无主机连接 / 线缆拔出
             self._log_err(f"write: {e}（主机未连接或未识别，继续等待）")
+            self.connected = False
             try:
                 os.close(self.fd)
             except OSError:
@@ -140,7 +150,9 @@ class Injector:
         self.buttons = 0                 # 鼠标按键状态
         self.grabbing = False
         self._last_move = 0.0
+        self._last_event_ts = time.monotonic()  # 看门狗计时：事件断流时强制抬左键
         self._move_interval = 1.0 / move_rate
+        self._ignore_until = 0.0         # 主机刚接入时的防误触窗口
 
     # -- HID 报告 ----------------------------------------------------------
     def _mouse(self, wheel: int = 0) -> bytes:
@@ -186,14 +198,21 @@ class Injector:
             self.ny = max(0.0, min(1.0, float(ev["y"])))
 
     def _click(self):
+        # 拖拽中的 CLICK 若在这里抬键，会议屏上的按下会被取消
+        if self.grabbing:
+            return False
         self.hid.write(self._mouse())                      # 鼠标：先到位
         self.buttons |= BTN_LEFT
         self.hid.write(self._mouse())
         self.hid.write(self._touch(c0=(True, self.nx, self.ny)))  # 触摸：按下
-        time.sleep(CLICK_HOLD_S)
+        time.sleep(CLICK_HOLD_S / 2)
+        # 保持期间补一帧按下：单帧触点容易被触摸主机过滤掉
+        self.hid.write(self._touch(c0=(True, self.nx, self.ny)))
+        time.sleep(CLICK_HOLD_S / 2)
         self.buttons &= ~BTN_LEFT
         self.hid.write(self._mouse())
         self.hid.write(self._touch())                      # 触摸：抬起
+        return True
 
     def _swipe(self, dx: float, dy: float, wheel: int = 0):
         sx, sy = self.nx, self.ny
@@ -231,8 +250,25 @@ class Injector:
 
     # -- 事件分发 -----------------------------------------------------------
     def handle(self, ev: dict):
+        # 主机刚接入：清空按键/触摸/键盘状态，并丢弃紧跟着的一小段事件。
+        # 插线瞬间手通常正在画面里（插线动作本身会被识别成 SWIPE/CLICK），
+        # 不拦一下就会灌给主机一串误触。
+        if getattr(self.hid, "just_connected", False):
+            self.hid.just_connected = False
+            self.buttons = 0
+            self.grabbing = False
+            self.hid.write(self._mouse())
+            self.hid.write(self._touch())
+            self.hid.write(self._keyboard())
+            self._ignore_until = time.monotonic() + 1.5
+            print("[hid] 主机已连接，1.5s 内的事件丢弃（防插线误触）", flush=True)
+            return
+        if time.monotonic() < self._ignore_until:
+            return
+
         act = ev.get("action")
         self._set_xy(ev)
+        self._last_event_ts = time.monotonic()
 
         if act == "MOVE":
             now = time.monotonic()
@@ -257,7 +293,10 @@ class Injector:
             self.hid.write(self._keyboard())   # 兜底清空修饰键，防 Ctrl 卡死
 
         elif act == "CLICK":
-            self._click()
+            if self._click():
+                print(f"[inject] CLICK written at ({self.nx:.3f},{self.ny:.3f})", flush=True)
+            else:
+                print(f"[inject] CLICK suppressed (grabbing) at ({self.nx:.3f},{self.ny:.3f})", flush=True)
 
         elif act == "SWIPE_UP":
             self._swipe(0, -SWIPE_DIST, wheel=1)
@@ -292,6 +331,7 @@ def follow_file(path: str):
             if line:
                 yield line
                 continue
+            yield ""                    # 空闲心跳，让主循环能跑看门狗
             # 检查文件是否被替换（日志轮转等）
             try:
                 if os.stat(path).st_ino != inode:
@@ -306,6 +346,7 @@ def follow_file(path: str):
                 fd.close()
                 fd = None
             print(f"[inject] 等待事件文件 {path} ...", flush=True)
+            yield ""                    # 文件丢失期间也要让看门狗 tick
             time.sleep(1.0)
 
 
@@ -324,13 +365,27 @@ def main() -> int:
 
     lines = sys.stdin if args.stdin else follow_file(args.events)
     n = 0
+    skipped = 0
     for line in lines:
+        if inj.grabbing and time.monotonic() - inj._last_event_ts > GRAB_WATCHDOG_S:
+            # 事件流断了左键还按着（识别崩溃/RELEASE 被当陈旧事件丢弃）→ 强制抬起
+            inj.handle({"action": "RELEASE", "ts": int(time.time() * 1000)})
+            print("[inject] watchdog: 事件断流，强制 RELEASE", flush=True)
         line = line.strip()
         if not line or not line.startswith("{"):
             continue
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        # 丢弃超过 1s 的陈旧事件：断连时写失败会拖慢主循环（每次 0.5s），
+        # 事件在文件里越积越多，不丢的话重连后要花几分钟"补放"历史手势，
+        # 实时手势被压在积压后面，表现为点击/操作延迟很久才出现。
+        ev_ts = ev.get("ts")
+        if isinstance(ev_ts, (int, float)) and time.time() * 1000 - ev_ts > 1000:
+            skipped += 1
+            if skipped % 500 == 0:
+                print(f"[inject] {skipped} stale events skipped", flush=True)
             continue
         inj.handle(ev)
         n += 1

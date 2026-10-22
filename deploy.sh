@@ -36,16 +36,16 @@ for m in models/palm_detection_mediapipe_2023feb.onnx \
          models/handpose_estimation_mediapipe_2023feb.onnx; do
     if [ ! -f "$m" ]; then
         echo "缺少模型: $m"
-        echo "请先上传 models/ 目录，或从以下地址下载："
-        echo "  https://hf-mirror.com/opencv/opencv_zoo/resolve/main/models/palm_detection_mediapipe/palm_detection_mediapipe_2023feb.onnx"
-        echo "  https://hf-mirror.com/opencv/opencv_zoo/resolve/main/models/hand_pose_estimation/handpose_estimation_mediapipe_2023feb.onnx"
+        echo "请从 opencv_zoo 官方仓库下载（见 README「模型下载」一节）："
+        echo "  https://github.com/opencv/opencv_zoo/raw/main/models/palm_detection_mediapipe/palm_detection_mediapipe_2023feb.onnx"
+        echo "  https://github.com/opencv/opencv_zoo/raw/main/models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx"
         exit 1
     fi
     echo "    $(basename "$m") $(stat -c%s "$m") bytes"
 done
 
 echo "==> 自检（推理链路）"
-python3 selftest.py
+python3 tests/selftest.py
 
 echo
 echo "部署完成。运行："
